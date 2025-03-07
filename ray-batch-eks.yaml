@@ -1,0 +1,181 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ray-job-code-sample
+  namespace: rayserve-vllm
+data:
+  sample_code.py: |
+    import ray
+    from vllm import LLM, SamplingParams
+    from typing import Dict, List
+    import json
+    import os
+    from huggingface_hub import login
+
+    # Initialize Ray
+    ray.init()
+
+    # Sample dataset - you can replace this with your actual data source
+    prompts = [
+        "Explain quantum computing in simple terms.",
+        "What are the main challenges in AI?",
+        "How does photosynthesis work?",
+        "Describe the water cycle.",
+        "What is climate change?"
+    ]
+    ds = ray.data.from_items([{"prompt": p} for p in prompts])
+
+    BATCH_SIZE = 4
+
+    class TextGenerator:
+        def __init__(self):
+            # Login to Hugging Face
+            hf_token = os.getenv("HUGGING_FACE_HUB_TOKEN")
+            if not hf_token:
+                raise ValueError("HUGGING_FACE_HUB_TOKEN not set")
+            login(token=hf_token)
+
+            # Initialize vLLM
+            self.model = LLM(
+                model=os.getenv("MODEL_ID", "mistralai/Mistral-7B-Instruct-v0.2"),
+                dtype="auto",
+                gpu_memory_utilization=0.9,
+                max_model_len=8192
+            )
+            
+            self.sampling_params = SamplingParams(
+                temperature=0.7,
+                top_p=0.9,
+                max_tokens=512
+            )
+
+        def __call__(self, batch: Dict[str, List[str]]) -> Dict[str, List[str]]:
+            prompts = batch["prompt"]
+            outputs = self.model.generate(prompts, self.sampling_params)
+            
+            # Extract generated text from outputs
+            batch["generated_text"] = [output.outputs[0].text for output in outputs]
+            return batch
+
+    # Process the dataset using Ray
+    predictions = ds.map_batches(
+        TextGenerator,
+        compute=ray.data.ActorPoolStrategy(size=1),  # Number of GPU workers
+        num_gpus=1,  # GPUs per worker
+        batch_size=BATCH_SIZE
+    )
+
+    # Print results
+    print("Generated responses:")
+    for row in predictions.take_all():
+        print(f"\nPrompt: {row['prompt']}")
+        print(f"Response: {row['generated_text']}\n")
+        print("-" * 80)
+
+---
+apiVersion: ray.io/v1
+kind: RayJob
+metadata:
+  name: vllm-batch-job
+  namespace: rayserve-vllm
+spec:
+  entrypoint: python /home/ray/samples/sample_code.py
+  shutdownAfterJobFinishes: true
+  rayClusterSpec:
+    rayVersion: '2.43.0'
+    headGroupSpec:
+      rayStartParams:
+        dashboard-host: '0.0.0.0'
+      template:
+        spec:
+          containers:
+            - name: ray-head
+              image: public.ecr.aws/j5k9c6o6/eks-genai-workshop:latest
+              ports:
+                - containerPort: 6379
+                  name: gcs-server
+                - containerPort: 8265
+                  name: dashboard
+                - containerPort: 10001
+                  name: client
+              resources:
+                limits:
+                  cpu: "2"
+                  memory: "12Gi"
+                requests:
+                  cpu: "2"
+                  memory: "12Gi"
+              env:
+                - name: PYTHONPATH
+                  value: "/home/ray/python"
+                - name: HUGGING_FACE_HUB_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: hf-token
+                      key: hf-token
+              volumeMounts:
+                - mountPath: /home/ray/samples
+                  name: code-sample
+          volumes:
+            - name: code-sample
+              configMap:
+                name: ray-job-code-sample
+                items:
+                  - key: sample_code.py
+                    path: sample_code.py
+          nodeSelector:
+            NodeGroupType: x86-cpu-karpenter
+            type: karpenter
+    workerGroupSpecs:
+      - groupName: gpu-workers
+        replicas: 1
+        minReplicas: 1
+        maxReplicas: 1
+        rayStartParams: {}
+        template:
+          spec:
+            containers:
+              - name: ray-worker
+                image: public.ecr.aws/j5k9c6o6/eks-genai-workshop:latest
+                resources:
+                  limits:
+                    cpu: "10"
+                    memory: "60Gi"
+                    nvidia.com/gpu: "1"
+                  requests:
+                    cpu: "10"
+                    memory: "60Gi"
+                    nvidia.com/gpu: "1"
+                env:
+                  - name: PYTHONPATH
+                    value: "/home/ray/python"
+                  - name: HUGGING_FACE_HUB_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: hf-token
+                        key: hf-token
+                volumeMounts:
+                  - mountPath: /home/ray/samples
+                    name: code-sample
+            volumes:
+              - name: code-sample
+                configMap:
+                  name: ray-job-code-sample
+                  items:
+                    - key: sample_code.py
+                      path: sample_code.py
+            nodeSelector:
+              NodeGroupType: g5-gpu-karpenter
+              type: karpenter
+            tolerations:
+              - key: "nvidia.com/gpu"
+                operator: "Exists"
+                effect: "NoSchedule"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: hf-token
+  namespace: rayserve-vllm
+stringData:
+  hf-token: token

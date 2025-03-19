@@ -1,0 +1,395 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: hf-token
+stringData:
+  hf-token: 
+  
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vllm-serve-script
+data:
+  vllm_serve.py: |
+    import os
+    import logging
+    from typing import AsyncGenerator, Optional
+
+    from fastapi import FastAPI, BackgroundTasks
+    from starlette.requests import Request
+    from starlette.responses import StreamingResponse, Response, JSONResponse
+
+    from ray import serve
+
+    from vllm.engine.arg_utils import AsyncEngineArgs
+    from vllm.engine.async_llm_engine import AsyncLLMEngine
+    from vllm.sampling_params import SamplingParams
+    from vllm.utils import random_uuid
+    from vllm.entrypoints.openai.protocol import (
+        ChatCompletionRequest,
+        ChatCompletionResponse,
+        ErrorResponse,
+    )
+    from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
+    from vllm.entrypoints.openai.serving_models import OpenAIServingModels, BaseModelPath
+    from vllm.config import ModelConfig
+    from huggingface_hub import login
+    import json
+
+    # Initialize FastAPI and logger
+    app = FastAPI()
+    logger = logging.getLogger("ray.serve")
+
+    @serve.deployment(name="mistral-deployment",
+        ray_actor_options={"num_gpus": 1},
+        autoscaling_config={"min_replicas": 1, "max_replicas": 2},
+    )
+    @serve.ingress(app)
+    class VLLMDeployment:
+        def __init__(
+            self,
+            model: str = None,
+            tensor_parallel_size: int = 1,
+            max_num_seqs: int = 32,
+            block_size: int = 4096,
+            max_model_len: int = 8192,
+            response_role: str = "assistant",
+            chat_template: Optional[str] = None,
+        ):
+            logger.info("VLLMDeployment is initializing...")
+            
+            # Login to Hugging Face
+            hf_token = os.getenv("HUGGING_FACE_HUB_TOKEN")
+            logger.info(f"token: {hf_token=}")
+            if not hf_token:
+                raise ValueError("HUGGING_FACE_HUB_TOKEN environment variable is not set")
+            login(token=hf_token)
+            logger.info("Successfully logged in to Hugging Face Hub")
+            
+            # Get model ID from environment or use default
+            model = os.getenv("MODEL_ID", "mistralai/Mistral-7B-Instruct-v0.2")
+            
+            self.model_config = ModelConfig(
+                model=model,
+                task="generate",
+                tokenizer=model,  # Use same model path for tokenizer
+                tokenizer_mode="auto",
+                trust_remote_code=True,
+                dtype="bfloat16",
+                seed=42,
+                max_model_len=max_model_len,
+            )
+
+            self.models = OpenAIServingModels(
+                engine_client=None,  # Will be initialized later
+                model_config=self.model_config,
+                base_model_paths=[BaseModelPath(name=model, model_path=model)]
+            )
+
+            # Initialize VLLM Engine
+            engine_args = AsyncEngineArgs(
+                model=model,
+                tensor_parallel_size=tensor_parallel_size,
+                max_num_seqs=max_num_seqs,
+                block_size=block_size,
+                max_model_len=max_model_len,
+                disable_log_requests=True,
+                device="cuda",
+                dtype="bfloat16",
+                trust_remote_code=True,
+                gpu_memory_utilization=float(os.getenv("GPU_MEMORY_UTILIZATION", "0.9")),
+                max_num_batched_tokens=int(os.getenv("MAX_NUM_BATCHED_TOKENS", "32768")),
+            )
+            logger.info(f"Engine Args Initialized: {engine_args}")
+
+            self.engine = AsyncLLMEngine.from_engine_args(engine_args)
+            self.response_role = response_role
+            self.chat_template = chat_template
+            self.openai_serving_chat = None
+            self.max_model_len = max_model_len
+            
+            logger.info(f"VLLM Engine initialized with max_model_len: {self.max_model_len}")
+
+        async def health_check(self):
+            """Health check for Ray Serve deployment"""
+            logger.info("Health check passed for VLLMDeployment.")
+            return "OK"
+
+        # Basic API
+        async def stream_results(self, results_generator) -> AsyncGenerator[bytes, None]:
+            num_returned = 0
+            async for request_output in results_generator:
+                text_outputs = [output.text for output in request_output.outputs]
+                assert len(text_outputs) == 1
+                text_output = text_outputs[0][num_returned:]
+                ret = {"text": text_output}
+                yield (json.dumps(ret) + "\n").encode("utf-8")
+                num_returned += len(text_output)
+
+        async def may_abort_request(self, request_id) -> None:
+            await self.engine.abort(request_id)
+
+        @app.post("/")
+        async def basic_generate(self, request: Request) -> Response:
+            try:
+                request_dict = await request.json()
+            except json.JSONDecodeError:
+                return JSONResponse(status_code=400, content={"error": "Invalid JSON in request body"})
+
+            context_length = request_dict.pop("context_length", 8192)  # Default to 8k
+
+            # Ensure context length is within model limits
+            if context_length not in [8192, 32768]:
+                context_length = 8192  # Default to 8k if invalid
+            prompt = request_dict.pop("prompt")
+            stream = request_dict.pop("stream", False)
+
+            # Get model config and tokenizer
+            model_config = await self.engine.get_model_config()
+            tokenizer = await self.engine.get_tokenizer()
+
+            input_token_ids = tokenizer.encode(prompt)
+            input_tokens = len(input_token_ids)
+            max_possible_new_tokens = min(context_length, model_config.max_model_len) - input_tokens
+            max_new_tokens = min(request_dict.get("max_tokens", 8192), max_possible_new_tokens)
+
+            sampling_params = SamplingParams(
+                max_tokens=max_new_tokens,
+                temperature=request_dict.get("temperature", 0.7),
+                top_p=request_dict.get("top_p", 0.9),
+                top_k=request_dict.get("top_k", 50),
+                stop=request_dict.get("stop", None),
+            )
+
+            request_id = random_uuid()
+            logger.info(f"Processing request {request_id} with {input_tokens} input tokens")
+
+            results_generator = self.engine.generate(prompt, sampling_params, request_id)
+
+            if stream:
+                background_tasks = BackgroundTasks()
+                # Using background_tasks to abort the request if the client disconnects
+                background_tasks.add_task(self.may_abort_request, request_id)
+                return StreamingResponse(
+                    self.stream_results(results_generator), background=background_tasks
+                )
+
+            # Non-streaming case
+            final_output = None
+            async for request_output in results_generator:
+                if await request.is_disconnected():
+                    # Abort the request if the client disconnects
+                    await self.engine.abort(request_id)
+                    logger.warning(f"Client disconnected for request {request_id}")
+                    return Response(status_code=499)
+                final_output = request_output
+
+            assert final_output is not None
+            prompt = final_output.prompt
+            text_outputs = [prompt + output.text for output in final_output.outputs]
+            ret = {"text": text_outputs}
+            logger.info(f"Completed request {request_id}")
+            return Response(content=json.dumps(ret))
+            
+        # OpenAI API
+        @app.get("/v1/models")
+        async def get_models(self):
+            """List available models in OpenAI format."""
+            return JSONResponse(
+                content={
+                    "object": "list",
+                    "data": [
+                        {
+                            "id": self.model_config.model,
+                            "object": "model",
+                            "owned_by": "organization",
+                            "permission": [],
+                        }
+                    ],
+                }
+            )
+
+        @app.post("/v1/chat/completions")
+        async def create_chat_completion(
+            self, request: Request
+        ):
+            """Handle chat requests with OpenAI-compatible response format."""
+            try:
+                body = await request.json()
+                chat_request = ChatCompletionRequest(**body)
+            except Exception as e:
+                error_resp = ErrorResponse(message=str(e), code=400)
+                return JSONResponse(content=error_resp.model_dump(), status_code=error_resp.code)
+                
+            if not self.openai_serving_chat:
+                logger.info("Initializing OpenAIServingChat instance...")
+
+                self.openai_serving_chat = OpenAIServingChat(
+                    engine_client=self.engine,
+                    model_config=self.model_config,
+                    models=self.models,
+                    response_role=self.response_role,
+                    chat_template=self.chat_template,
+                )
+
+            logger.info(f"Received chat request: {chat_request}")
+            generator = await self.openai_serving_chat.create_chat_completion(chat_request, request)
+
+            if isinstance(generator, ErrorResponse):
+                return JSONResponse(content=generator.model_dump(), status_code=generator.code)
+
+            if chat_request.stream:
+                return StreamingResponse(content=generator, media_type="text/event-stream")
+            else:
+                assert isinstance(generator, ChatCompletionResponse)
+                return JSONResponse(content=generator.model_dump())
+    
+    # Make sure this is exported correctly as a deployment
+    deployment = VLLMDeployment.bind()
+
+
+---
+apiVersion: ray.io/v1
+kind: RayService
+metadata:
+  name: vllm
+spec:
+  serviceUnhealthySecondThreshold: 1800
+  deploymentUnhealthySecondThreshold: 1800
+  serveConfigV2: |
+    applications:
+      - name: mistral
+        import_path: vllm_serve:deployment
+        route_prefix: "/vllm"
+        runtime_env:
+          env_vars:
+            PYTHONPATH: "/home/ray/python"
+            LD_LIBRARY_PATH: "/home/ray/anaconda3/lib:$LD_LIBRARY_PATH"
+            MODEL_ID: "mistralai/Mistral-7B-Instruct-v0.3"
+            GPU_MEMORY_UTILIZATION: "0.9"
+            MAX_MODEL_LEN: "8192"
+            MAX_NUM_SEQ: "4"
+            MAX_NUM_BATCHED_TOKENS: "32768"
+  rayClusterConfig:
+    rayVersion: '2.43.0'
+    enableInTreeAutoscaling: true
+    headGroupSpec:
+      serviceType: LoadBalancer
+      headService:
+        metadata:
+          name: vllm
+      rayStartParams:
+        dashboard-host: '0.0.0.0'
+        num-cpus: "0"
+      template:
+        spec:
+          containers:
+          - name: ray-head
+            image: public.ecr.aws/j5k9c6o6/eks-genai-workshop:latest
+            imagePullPolicy: IfNotPresent
+            lifecycle:
+              preStop:
+                exec:
+                  command: ["/bin/sh", "-c", "ray stop"]
+            ports:
+            - containerPort: 6379
+              name: gcs
+            - containerPort: 8265
+              name: dashboard
+            - containerPort: 10001
+              name: client
+            - containerPort: 8000
+              name: serve
+            - containerPort: 52365
+              name: dashboard-agent
+            volumeMounts:
+            - mountPath: /tmp/ray
+              name: ray-logs
+            - name: vllm-script
+              mountPath: /home/ray/python/vllm_serve.py
+              subPath: vllm_serve.py
+            resources:
+              limits:
+                cpu: 2
+                memory: "12G"
+              requests:
+                cpu: 2
+                memory: "12G"
+            env:
+            - name: PYTHONPATH
+              value: "/home/ray/python"
+            - name: VLLM_PORT
+              value: "8004"
+            - name: LD_LIBRARY_PATH
+              value: "/home/ray/anaconda3/lib:$LD_LIBRARY_PATH"
+            - name: HUGGING_FACE_HUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: hf-token
+          nodeSelector:
+            NodeGroupType: x86-cpu-karpenter
+            type: karpenter
+          volumes:
+          - name: ray-logs
+            emptyDir: {}
+          - name: vllm-script
+            configMap:
+              name: vllm-serve-script
+    workerGroupSpecs:
+    - replicas: 1
+      minReplicas: 1
+      maxReplicas: 1
+      groupName: gpu-group
+      rayStartParams: {}
+      template:
+        spec:
+          containers:
+          - name: ray-worker
+            image: public.ecr.aws/j5k9c6o6/eks-genai-workshop:latest
+            imagePullPolicy: IfNotPresent
+            lifecycle:
+              preStop:
+                exec:
+                  command: ["/bin/sh", "-c", "ray stop"]
+            volumeMounts:
+            - mountPath: /tmp/ray
+              name: ray-logs
+            - name: vllm-script
+              mountPath: /home/ray/python/vllm_serve.py
+              subPath: vllm_serve.py
+            resources:
+              limits:
+                cpu: 6
+                memory: "28Gi"  
+                nvidia.com/gpu: 1
+              requests:
+                cpu: 6
+                memory: "28Gi"  
+                nvidia.com/gpu: 1
+            env:
+            - name: PYTHONPATH
+              value: "/home/ray/python"
+            - name: VLLM_PORT
+              value: "8004"
+            - name: LD_LIBRARY_PATH
+              value: "/home/ray/anaconda3/lib:$LD_LIBRARY_PATH"
+            - name: HUGGING_FACE_HUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: hf-token
+          volumes:
+          - name: ray-logs
+            emptyDir: {}
+          - name: vllm-script
+            configMap:
+              name: vllm-serve-script
+          nodeSelector:
+            NodeGroupType: g5-gpu-karpenter
+            type: karpenter
+          tolerations:
+          - key: "nvidia.com/gpu"
+            operator: "Exists"
+            effect: "NoSchedule"
